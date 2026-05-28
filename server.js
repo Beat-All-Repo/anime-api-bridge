@@ -14,6 +14,7 @@ const { MongoClient, ServerApiVersion } = require("mongodb");
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { Api } = require("telegram/tl");
+const { Logger } = require("telegram/extensions/Logger");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. ENVIRONMENT VARIABLE VALIDATION — fail fast, fail loud
@@ -541,6 +542,16 @@ async function bootstrap() {
    * An empty StringSession is used because this service authenticates as a
    * Bot via token, not as a user account. GramJS stores no session state.
    */
+  /**
+   * GramJS's Logger must be an actual instance of its own Logger class.
+   * Passing a plain-object shim causes "this._log.info is not a function"
+   * inside TelegramBaseClient's constructor (seen on GramJS >=2.x / Node 26).
+   *
+   * "none" suppresses debug/info/warn noise on Render's log stream while
+   * still allowing error-level MTProto failures to surface.
+   */
+  const gramLogger = new Logger("none");
+
   tgClient = new TelegramClient(
     new StringSession(""),
     TELEGRAM_API_ID,
@@ -549,19 +560,7 @@ async function bootstrap() {
       connectionRetries: 5,
       retryDelay: 2000,
       autoReconnect: true,
-      /**
-       * Suppress GramJS's default verbose logging to keep Render log streams
-       * clean. Errors are still surfaced via the try/catch in route C.
-       */
-      baseLogger: {
-        levels: [],
-        getLogger: () => ({
-          debug: () => {},
-          info: () => {},
-          warn: (msg) => console.warn("[GramJS WARN]", msg),
-          error: (msg) => console.error("[GramJS ERROR]", msg),
-        }),
-      },
+      baseLogger: gramLogger,
     }
   );
 
