@@ -188,6 +188,63 @@ app.get("/api/series/:slug", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 5.5 NEW ROUTE — GET /api/anime/:slug/watch
+//     THE TRAFFIC CONTROLLER (Resolves streaming methods)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/anime/:slug/watch", async (req, res) => {
+  const { slug } = req.params;
+  const episodeNum = parseInt(req.query.episode, 10);
+
+  if (!slug || isNaN(episodeNum)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: "Missing anime slug or valid 'episode' query parameter." 
+    });
+  }
+
+  try {
+    // 1. Find the anime document in MongoDB
+    const series = await animeCollection.findOne({ anime_id: slug.trim().toLowerCase() });
+    
+    if (!series) {
+      return res.status(404).json({ success: false, error: "Anime series not found in database." });
+    }
+
+    // 2. Find the requested episode inside the array
+    const ep = series.episodes?.find(e => e.episode_number === episodeNum);
+    if (!ep || !ep.sources || ep.sources.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: `Episode ${episodeNum} is not indexed yet for this series.` 
+      });
+    }
+
+    // 3. Grab the first available streaming source (or loop to find preferred quality)
+    const source = ep.sources[0]; 
+
+    // CASE A: It's a Telegram file source -> Redirect to your Route C video streamer!
+    if (source.message_id && source.channel_id) {
+      console.log(`[WATCH] Episode found via Telegram. Redirecting to Route C streamer...`);
+      return res.redirect(`/stream/telegram/${source.channel_id}/${source.message_id}`);
+    }
+
+    // CASE B: It's a P2P Magnet link source
+    if (source.magnet) {
+      return res.status(501).json({
+        success: false,
+        error: "P2P Torrent streaming engine has not been integrated into Phase 1 yet."
+      });
+    }
+
+    return res.status(400).json({ success: false, error: "No valid streaming data found for this episode." });
+
+  } catch (err) {
+    console.error("[/api/anime/watch] Error resolving stream location:", err.message);
+    return res.status(500).json({ success: false, error: "Internal server error." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 6. ROUTE C — GET /stream/telegram/:channelId/:messageId
 //    CORE PARTIAL-CONTENT STREAMING ENGINE
 // ─────────────────────────────────────────────────────────────────────────────
