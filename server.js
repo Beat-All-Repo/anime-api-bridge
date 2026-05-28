@@ -62,6 +62,12 @@ let mongoClient = null;
 let db = null;
 let animeCollection = null;
 let tgClient = null;
+/**
+ * tgReady is false until connectTelegramClient() succeeds.
+ * Route C checks this flag and returns 503 if Telegram is still
+ * handshaking so the caller can retry rather than receiving a crash.
+ */
+let tgReady = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. EXPRESS APP + CORS CONFIGURATION
@@ -187,6 +193,22 @@ app.get("/api/series/:slug", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/stream/telegram/:channelId/:messageId", async (req, res) => {
   const { channelId, messageId } = req.params;
+
+  // ── 6.0 Telegram readiness guard ──────────────────────────────────────────
+  /**
+   * The GramJS client connects asynchronously after port binding.
+   * Return 503 with a Retry-After hint if a stream request arrives
+   * before the MTProto session is established.
+   */
+  if (!tgReady || !tgClient) {
+    res.setHeader("Retry-After", "10");
+    return res.status(503).json({
+      success: false,
+      error:
+        "Telegram media client is still connecting. " +
+        "The server just started — please retry in a few seconds.",
+    });
+  }
 
   // ── 6.1 Validate path parameters ──────────────────────────────────────────
   if (!channelId || !messageId) {
@@ -479,8 +501,32 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 10. BOOTSTRAP PIPELINE — DB → INDEXES → TELEGRAM → HTTP SERVER
+// 10. BOOTSTRAP PIPELINE — DB → INDEXES → HTTP SERVER → TELEGRAM (background)
+//
+// CRITICAL RENDER FIX: app.listen() is called immediately after MongoDB is
+// ready so Render's port-scan sees an open port within its timeout window.
+// GramJS's tgClient.start() runs AFTER the port is bound because MTProto
+// authentication can take several seconds and was previously blocking the
+// entire bootstrap, causing Render to give up and kill the process.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Wraps a promise with a hard timeout. Rejects with a descriptive error
+ * if the inner promise does not resolve within `ms` milliseconds.
+ */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[TIMEOUT] ${label} did not complete within ${ms}ms`)),
+      ms
+    );
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 async function bootstrap() {
   // ── 10.1 MongoDB ──────────────────────────────────────────────────────────
   console.log("[BOOT] Connecting to MongoDB…");
@@ -508,76 +554,94 @@ async function bootstrap() {
   // ── 10.2 Collection Indexes ───────────────────────────────────────────────
   console.log("[BOOT] Ensuring collection indexes…");
 
-  /**
-   * Compound index for catalogue sort queries (newest, most episodes first).
-   * Using createIndex is idempotent — safe to call on every boot.
-   */
   await animeCollection.createIndex(
     { total_episodes_indexed: -1, last_updated: -1 },
-    {
-      name: "compound_catalog_sort",
-      background: true,
-    }
+    { name: "compound_catalog_sort", background: true }
   );
-
-  /**
-   * Unique index on anime_id enforces slug uniqueness and provides O(1)
-   * resolution for series lookups.
-   */
   await animeCollection.createIndex(
     { anime_id: 1 },
-    {
-      name: "unique_anime_id_slug",
-      unique: true,
-      background: true,
-    }
+    { name: "unique_anime_id_slug", unique: true, background: true }
   );
 
   console.log("[BOOT] Collection indexes are in place.");
 
-  // ── 10.3 GramJS Telegram Client ───────────────────────────────────────────
-  console.log("[BOOT] Initialising GramJS Telegram client…");
-
+  // ── 10.3 HTTP Server — bind port FIRST so Render does not time out ────────
   /**
-   * An empty StringSession is used because this service authenticates as a
-   * Bot via token, not as a user account. GramJS stores no session state.
-   */
-  /**
-   * GramJS's Logger must be an actual instance of its own Logger class.
-   * Passing a plain-object shim causes "this._log.info is not a function"
-   * inside TelegramBaseClient's constructor (seen on GramJS >=2.x / Node 26).
+   * Render's deploy runner scans for an open TCP port after the process
+   * starts. If no port is detected within ~60 s, the deploy is killed.
+   * tgClient.start() performs a full MTProto handshake which can take
+   * 10–30 s on cold starts. Binding the port here ensures Render marks
+   * the service as live before that handshake begins.
    *
-   * "none" suppresses debug/info/warn noise on Render's log stream while
-   * still allowing error-level MTProto failures to surface.
+   * Incoming stream requests that arrive before Telegram is ready receive
+   * a 503 Service Unavailable (handled inside Route C via the tgReady flag).
    */
-  const gramLogger = new Logger("none");
+  await new Promise((resolve) => {
+    app.listen(PORT, () => {
+      console.log(`[BOOT] HTTP server bound on port ${PORT} — Render port-scan satisfied.`);
+      console.log(`[BOOT] Health check → http://localhost:${PORT}/health`);
+      console.log(`[BOOT] Catalogue    → http://localhost:${PORT}/api/catalog`);
+      console.log(`[BOOT] Series       → http://localhost:${PORT}/api/series/:slug`);
+      console.log(`[BOOT] Stream       → http://localhost:${PORT}/stream/telegram/:channelId/:messageId`);
+      resolve();
+    });
+  });
 
-  tgClient = new TelegramClient(
-    new StringSession(""),
-    TELEGRAM_API_ID,
-    TELEGRAM_API_HASH,
-    {
-      connectionRetries: 5,
-      retryDelay: 2000,
-      autoReconnect: true,
-      baseLogger: gramLogger,
+  // ── 10.4 GramJS Telegram Client — connect in background after port is up ──
+  console.log("[BOOT] Starting GramJS Telegram client (background)…");
+  connectTelegramClient(); // intentionally not awaited — see function below
+}
+
+/**
+ * Builds, authenticates, and assigns the GramJS client.
+ * Runs entirely outside the main bootstrap await chain so it cannot
+ * delay port binding. Retries indefinitely with a 15 s back-off on
+ * failure, because transient MTProto DC errors are common on cold starts.
+ */
+async function connectTelegramClient() {
+  const TELEGRAM_CONNECT_TIMEOUT_MS = 60000; // 60 s per attempt
+  const TELEGRAM_RETRY_DELAY_MS = 15000;     // 15 s between retries
+
+  while (true) {
+    try {
+      /**
+       * GramJS's Logger must be a real Logger instance — not a plain-object
+       * shim — or its constructor crashes with "this._log.info is not a function".
+       */
+      const gramLogger = new Logger("none");
+
+      const client = new TelegramClient(
+        new StringSession(""),
+        TELEGRAM_API_ID,
+        TELEGRAM_API_HASH,
+        {
+          connectionRetries: 5,
+          retryDelay: 2000,
+          autoReconnect: true,
+          baseLogger: gramLogger,
+        }
+      );
+
+      await withTimeout(
+        client.start({ botAuthToken: TELEGRAM_BOT_TOKEN }),
+        TELEGRAM_CONNECT_TIMEOUT_MS,
+        "tgClient.start()"
+      );
+
+      tgClient = client;
+      tgReady = true;
+      console.log("[TELEGRAM] Client authenticated. MTProto session active.");
+      return; // success — exit the retry loop
+
+    } catch (err) {
+      console.error(
+        `[TELEGRAM] Connection attempt failed: ${err.message}. ` +
+        `Retrying in ${TELEGRAM_RETRY_DELAY_MS / 1000} s…`
+      );
+      tgReady = false;
+      await new Promise((r) => setTimeout(r, TELEGRAM_RETRY_DELAY_MS));
     }
-  );
-
-  await tgClient.start({
-    botAuthToken: TELEGRAM_BOT_TOKEN,
-  });
-
-  console.log("[BOOT] Telegram client authenticated as bot. MTProto session active.");
-
-  // ── 10.4 HTTP Server ──────────────────────────────────────────────────────
-  app.listen(PORT, () => {
-    console.log(`[BOOT] anime-api-bridge is live on port ${PORT}`);
-    console.log(`[BOOT] Health check → http://localhost:${PORT}/health`);
-    console.log(`[BOOT] Catalogue    → http://localhost:${PORT}/api/catalog`);
-    console.log(`[BOOT] Series       → http://localhost:${PORT}/api/series/:slug`);
-    console.log(`[BOOT] Stream       → http://localhost:${PORT}/stream/telegram/:channelId/:messageId`);
-  });
+  }
 }
 
 bootstrap().catch((err) => {
