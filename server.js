@@ -13,6 +13,10 @@
  *  4. All previous streaming/validation logic preserved and hardened
  *  5. FIX: Index creation wrapped in try/catch to handle IndexOptionsConflict (code 85)
  *          when indexer.js has already created the same index under a different name.
+ *  6. FIX: Telegram fallthrough now returns 503 + retry_after instead of silently
+ *          falling through to iframe when tgReady is false.
+ *  7. FIX: Iframe backup pre-warmed on bootstrap to prevent first-request cold lag.
+ *  8. FIX: tried{} object now accurately reflects what was actually attempted.
  */
 
 require("dotenv").config();
@@ -277,6 +281,11 @@ app.get("/api/series/:slug", async (req, res) => {
 //  Priority 1: Magnet/Torrent  (Nyaa-scraped magnets or caption-provided magnet)
 //  Priority 2: Telegram stream (GramJS partial-content via /stream/telegram/...)
 //  Priority 3: Iframe API      (beat-anime-api-backup, prefer as-cdn21.top)
+//
+//  FIX: If tgReady is false at request time, return 503 + retry_after instead
+//       of silently falling through to iframe — prevents false "exhausted" errors.
+//  FIX: tried{} now accurately reflects what was actually attempted, not just
+//       what sources exist in the DB.
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get("/api/anime/:slug/watch", async (req, res) => {
@@ -290,6 +299,9 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
       error: "Missing slug or valid 'episode' query parameter.",
     });
   }
+
+  // Track what was actually attempted (not just what exists)
+  const attempted = { magnet: false, telegram: false, iframe: false };
 
   try {
     const series = await animeCollection.findOne({ anime_id: slug.trim().toLowerCase() });
@@ -344,6 +356,7 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
 
     // ── Priority 1: Magnet/Torrent ─────────────────────────────────────────
     if (preferMode !== "telegram" && preferMode !== "iframe" && allMagnets.length > 0) {
+      attempted.magnet = true;
       return res.status(200).json({
         success:     true,
         method:      "magnet",
@@ -357,15 +370,27 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
 
     // ── Priority 2: Telegram stream ────────────────────────────────────────
     if (preferMode !== "iframe" && telegramSource) {
+      attempted.telegram = true;
+
       if (!tgReady) {
-        console.warn(`[WATCH] Telegram not ready. Falling through to iframe for "${slug}" Ep${episodeNum}.`);
-      } else {
-        console.log(`[WATCH] Routing to Telegram stream: ch=${telegramSource.channel_id} msg=${telegramSource.message_id}`);
-        return res.redirect(`/stream/telegram/${telegramSource.channel_id}/${telegramSource.message_id}`);
+        // FIX: Return a retryable 503 instead of silently falling through.
+        // This prevents the misleading "All streaming methods exhausted" error
+        // when GramJS is still initializing on cold start.
+        console.warn(`[WATCH] Telegram not ready — returning 503 retry for "${slug}" Ep${episodeNum}.`);
+        return res.status(503).json({
+          success:     false,
+          error:       "Telegram client is still initializing. Please retry in 10–15 seconds.",
+          retry_after: 15,
+          tried:       { ...attempted, telegram: "pending" },
+        });
       }
+
+      console.log(`[WATCH] Routing to Telegram stream: ch=${telegramSource.channel_id} msg=${telegramSource.message_id}`);
+      return res.redirect(`/stream/telegram/${telegramSource.channel_id}/${telegramSource.message_id}`);
     }
 
     // ── Priority 3: Iframe API ─────────────────────────────────────────────
+    attempted.iframe = true;
     console.log(`[WATCH] Resolving iframe stream for "${series.title}" Ep${episodeNum} S${seasonNumber}…`);
     const embeds = await resolveIframeStream(series.title, episodeNum, seasonNumber);
 
@@ -385,11 +410,7 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
     return res.status(503).json({
       success: false,
       error:   "All streaming methods exhausted. No valid source available for this episode.",
-      tried:   {
-        magnet:   allMagnets.length > 0,
-        telegram: !!telegramSource,
-        iframe:   true,
-      },
+      tried:   attempted,
     });
 
   } catch (err) {
@@ -659,7 +680,30 @@ async function ensureIndexes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 15. BOOTSTRAP PIPELINE
+// 15. IFRAME BACKUP WARMUP — fires on bootstrap, fire-and-forget
+//
+// FIX: Pre-warms the iframe backup service on startup so the first real
+//      request to that API doesn't hit a cold-start delay or timeout.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function warmupIframeBackup() {
+  try {
+    const ctrl = new AbortController();
+    const tid  = setTimeout(() => ctrl.abort(), 8000);
+    const r    = await fetch(`${IFRAME_API_BASE}/`, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": "BeatAniVerse-Bridge/1.0 (warmup)" },
+    });
+    clearTimeout(tid);
+    console.log(`[BOOT] Iframe backup warmed up (HTTP ${r.status}) → ${IFRAME_API_BASE}`);
+  } catch (e) {
+    const reason = e.name === "AbortError" ? "timeout after 8s" : e.message;
+    console.warn(`[BOOT] Iframe backup warmup skipped: ${reason}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. BOOTSTRAP PIPELINE
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function bootstrap() {
@@ -699,6 +743,9 @@ async function bootstrap() {
       resolve();
     });
   });
+
+  // ── Iframe backup warmup — fire-and-forget, do not block startup ───────────
+  warmupIframeBackup();
 
   // ── GramJS in background ───────────────────────────────────────────────────
   console.log("[BOOT] Starting GramJS client (background)…");
