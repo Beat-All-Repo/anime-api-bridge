@@ -11,6 +11,8 @@
  *       Priority 3 → Iframe API       (beat-anime-api-backup, prefer as-cdn21.top)
  *  3. New helper: resolveIframeStream(title, episodeNumber, seasonNumber)
  *  4. All previous streaming/validation logic preserved and hardened
+ *  5. FIX: Index creation wrapped in try/catch to handle IndexOptionsConflict (code 85)
+ *          when indexer.js has already created the same index under a different name.
  */
 
 require("dotenv").config();
@@ -40,13 +42,13 @@ for (const key of REQUIRED_ENV) {
 }
 if (missingEnv) process.exit(1);
 
-const MONGODB_URI       = process.env.MONGODB_URI.trim();
-const TELEGRAM_API_ID   = parseInt(process.env.TELEGRAM_API_ID.trim(), 10);
-const TELEGRAM_API_HASH = process.env.TELEGRAM_API_HASH.trim();
+const MONGODB_URI        = process.env.MONGODB_URI.trim();
+const TELEGRAM_API_ID    = parseInt(process.env.TELEGRAM_API_ID.trim(), 10);
+const TELEGRAM_API_HASH  = process.env.TELEGRAM_API_HASH.trim();
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN.trim();
-const PORT              = parseInt(process.env.PORT || "3000", 10);
-const DB_NAME           = process.env.DB_NAME || "beataniverse";      // FIX: was "anime_db"
-const COLLECTION_NAME   = "anime_series";
+const PORT               = parseInt(process.env.PORT || "3000", 10);
+const DB_NAME            = process.env.DB_NAME || "beataniverse";
+const COLLECTION_NAME    = "anime_series";
 
 // Iframe / external stream API config
 const IFRAME_API_BASE   = (process.env.IFRAME_API_URL || "https://beat-anime-api-backup.onrender.com").replace(/\/$/, "");
@@ -101,9 +103,6 @@ app.use(express.json({ limit: "1mb" }));
 async function resolveIframeStream(title, episodeNumber, seasonNumber = 1) {
   const TIMEOUT_MS = 12000;
 
-  /**
-   * Helper: fetch with abort timeout.
-   */
   async function fetchWithTimeout(url) {
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
@@ -137,9 +136,8 @@ async function resolveIframeStream(title, episodeNumber, seasonNumber = 1) {
       return null;
     }
 
-    // Pick the best-matching result (first result from the API, which is ranked)
-    const hit         = hits[0];
-    const externalId  = hit.anime_id || hit.id;
+    const hit        = hits[0];
+    const externalId = hit.anime_id || hit.id;
     if (!externalId) {
       console.warn(`[IFRAME] Result has no anime_id for "${title}"`);
       return null;
@@ -172,7 +170,6 @@ async function resolveIframeStream(title, episodeNumber, seasonNumber = 1) {
 
     if (embeds.length === 0) return null;
 
-    // Re-sort: entries containing the preferred CDN domain go to the front
     embeds.sort((a, b) => {
       const aPreferred = a.includes(IFRAME_CDN_PREFER) ? -1 : 0;
       const bPreferred = b.includes(IFRAME_CDN_PREFER) ? -1 : 0;
@@ -212,16 +209,15 @@ app.get("/ping", (_req, res) => {
 app.get("/health", async (_req, res) => {
   let dbOk = false;
   try {
-    // A cheap command that confirms the connection is actually alive
     await db.command({ ping: 1 });
     dbOk = true;
   } catch (_) { /* dbOk stays false */ }
 
-  const allOk = dbOk; // tgReady can be false on cold start — don't fail health for it
+  const allOk = dbOk;
   res.status(allOk ? 200 : 503).json({
     status:    allOk ? "ok" : "degraded",
-    db:        dbOk   ? "connected" : "unreachable",
-    telegram:  tgReady ? "ready"   : "connecting",
+    db:        dbOk    ? "connected"  : "unreachable",
+    telegram:  tgReady ? "ready"      : "connecting",
     uptime:    Math.floor(process.uptime()),
     memoryMB:  (process.memoryUsage().rss / 1024 / 1024).toFixed(1),
     timestamp: new Date().toISOString(),
@@ -284,9 +280,9 @@ app.get("/api/series/:slug", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get("/api/anime/:slug/watch", async (req, res) => {
-  const { slug }    = req.params;
-  const episodeNum  = parseInt(req.query.episode, 10);
-  const preferMode  = req.query.prefer || "auto";  // auto | magnet | telegram | iframe
+  const { slug }   = req.params;
+  const episodeNum = parseInt(req.query.episode, 10);
+  const preferMode = req.query.prefer || "auto";  // auto | magnet | telegram | iframe
 
   if (!slug || isNaN(episodeNum)) {
     return res.status(400).json({
@@ -300,7 +296,6 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
     if (!series)
       return res.status(404).json({ success: false, error: "Anime not found." });
 
-    // FIX: use episode_number (was episode_number in server, episode_num in indexer — now unified)
     const ep = series.episodes?.find((e) => e.episode_number === episodeNum);
 
     if (!ep || !ep.sources || ep.sources.length === 0) {
@@ -313,16 +308,13 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
     const seasonNumber = ep.season_number || 1;
 
     // ── Gather all sources ─────────────────────────────────────────────────
-    // Collect magnets from all sources (scraped Nyaa + caption-provided)
     const allMagnets = [];
     let   telegramSource = null;
     let   captionMagnet  = null;
 
     for (const src of ep.sources) {
-      // Caption-provided magnet
       if (src.magnet && !captionMagnet) captionMagnet = src.magnet;
 
-      // Nyaa-scraped magnets
       if (Array.isArray(src.magnets)) {
         for (const m of src.magnets) {
           if (m.magnet && !allMagnets.some((x) => x.magnet === m.magnet)) {
@@ -331,8 +323,6 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
         }
       }
 
-      // Best Telegram source (prefer highest quality)
-      // FIX: field names are now channel_id / message_id
       if (!telegramSource && src.channel_id && src.message_id) {
         telegramSource = src;
       }
@@ -348,7 +338,6 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
       return bScore - aScore || (b.seeders || 0) - (a.seeders || 0);
     });
 
-    // Add caption magnet at top if it isn't already in the list
     if (captionMagnet && !allMagnets.some((m) => m.magnet === captionMagnet)) {
       allMagnets.unshift({ group: "User-Provided", magnet: captionMagnet, seeders: null, size: null });
     }
@@ -356,13 +345,12 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
     // ── Priority 1: Magnet/Torrent ─────────────────────────────────────────
     if (preferMode !== "telegram" && preferMode !== "iframe" && allMagnets.length > 0) {
       return res.status(200).json({
-        success:  true,
-        method:   "magnet",
-        anime_id: slug,
-        episode:  episodeNum,
-        season:   seasonNumber,
-        magnets:  allMagnets,
-        // Convenience: best single magnet for clients that only handle one
+        success:     true,
+        method:      "magnet",
+        anime_id:    slug,
+        episode:     episodeNum,
+        season:      seasonNumber,
+        magnets:     allMagnets,
         best_magnet: allMagnets[0].magnet,
       });
     }
@@ -370,7 +358,6 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
     // ── Priority 2: Telegram stream ────────────────────────────────────────
     if (preferMode !== "iframe" && telegramSource) {
       if (!tgReady) {
-        // Telegram not ready yet — fall through to iframe if we can
         console.warn(`[WATCH] Telegram not ready. Falling through to iframe for "${slug}" Ep${episodeNum}.`);
       } else {
         console.log(`[WATCH] Routing to Telegram stream: ch=${telegramSource.channel_id} msg=${telegramSource.message_id}`);
@@ -384,11 +371,11 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
 
     if (embeds && embeds.length > 0) {
       return res.status(200).json({
-        success:  true,
-        method:   "iframe",
-        anime_id: slug,
-        episode:  episodeNum,
-        season:   seasonNumber,
+        success:       true,
+        method:        "iframe",
+        anime_id:      slug,
+        episode:       episodeNum,
+        season:        seasonNumber,
         embeds,
         primary_embed: embeds[0],
       });
@@ -447,8 +434,8 @@ app.get("/stream/telegram/:channelId/:messageId", async (req, res) => {
   let normalizedChannelId;
   try {
     let rawId = channelId.toString().trim();
-    if (rawId.startsWith("-100"))      rawId = rawId.slice(4);
-    else if (rawId.startsWith("-"))    rawId = rawId.slice(1);
+    if (rawId.startsWith("-100"))   rawId = rawId.slice(4);
+    else if (rawId.startsWith("-")) rawId = rawId.slice(1);
     normalizedChannelId = BigInt(rawId);
     if (normalizedChannelId <= 0n) throw new Error("Channel ID must resolve to a positive BigInt.");
   } catch (err) {
@@ -458,7 +445,7 @@ app.get("/stream/telegram/:channelId/:messageId", async (req, res) => {
   // ── Resolve Telegram message ───────────────────────────────────────────────
   let tgMessage;
   try {
-    const peer    = new Api.PeerChannel({ channelId: normalizedChannelId });
+    const peer     = new Api.PeerChannel({ channelId: normalizedChannelId });
     const messages = await tgClient.getMessages(peer, { ids: [parsedMessageId] });
 
     if (!messages || messages.length === 0 || !messages[0]) {
@@ -517,11 +504,11 @@ app.get("/stream/telegram/:channelId/:messageId", async (req, res) => {
 
   // ── Send 206 Partial Content headers ──────────────────────────────────────
   res.writeHead(206, {
-    "Content-Range":  `bytes ${startByte}-${endByte}/${totalFileSize}`,
-    "Accept-Ranges":  "bytes",
-    "Content-Length": chunkLength,
-    "Content-Type":   mimeType,
-    "Cache-Control":  "no-store",
+    "Content-Range":          `bytes ${startByte}-${endByte}/${totalFileSize}`,
+    "Accept-Ranges":          "bytes",
+    "Content-Length":         chunkLength,
+    "Content-Type":           mimeType,
+    "Cache-Control":          "no-store",
     "X-Content-Type-Options": "nosniff",
   });
 
@@ -539,14 +526,14 @@ app.get("/stream/telegram/:channelId/:messageId", async (req, res) => {
 
     for await (const chunk of tgClient.iterDownload({
       file: new Api.InputDocumentFileLocation({
-        id: document.id,
-        accessHash: document.accessHash,
+        id:            document.id,
+        accessHash:    document.accessHash,
         fileReference: document.fileReference,
-        thumbSize: "",
+        thumbSize:     "",
       }),
       requestSize: ITER_REQUEST_SIZE,
-      offset: BigInt(startByte),
-      limit: chunkLength,
+      offset:      BigInt(startByte),
+      limit:       chunkLength,
     })) {
       if (clientDisconnected) break;
 
@@ -625,7 +612,54 @@ function withTimeout(promise, ms, label) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 14. BOOTSTRAP PIPELINE
+// 14. INDEX HELPER — safely creates indexes, tolerates IndexOptionsConflict
+//
+// MongoDB error code 85 (IndexOptionsConflict) is thrown when the same key
+// pattern already exists under a different name (e.g. the auto-generated name
+// created by indexer.js).  The index is functionally identical so we can
+// safely skip creation and continue.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function ensureIndexes() {
+  const indexSpecs = [
+    {
+      key:     { total_episodes_indexed: -1, last_updated: -1 },
+      options: { name: "compound_catalog_sort", background: true },
+    },
+    {
+      key:     { anime_id: 1 },
+      options: { name: "unique_anime_id_slug", unique: true, background: true },
+    },
+  ];
+
+  for (const { key, options } of indexSpecs) {
+    try {
+      await animeCollection.createIndex(key, options);
+      console.log(`[BOOT] Index ensured: ${JSON.stringify(key)} → "${options.name}"`);
+    } catch (err) {
+      if (err.code === 85) {
+        // IndexOptionsConflict — same key pattern already exists under the
+        // auto-generated name created by indexer.js.  Functionally identical;
+        // safe to skip.
+        console.warn(
+          `[BOOT] Index already exists under a different name (skipping): ` +
+          `${JSON.stringify(key)} — "${options.name}" (code 85 IndexOptionsConflict)`
+        );
+      } else if (err.code === 86) {
+        // IndexKeySpecsConflict — same name, different keys.  Log and skip.
+        console.warn(
+          `[BOOT] Index name conflict for "${options.name}" (code 86 IndexKeySpecsConflict). Skipping.`
+        );
+      } else {
+        // Unexpected error — re-throw to halt bootstrap
+        throw err;
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. BOOTSTRAP PIPELINE
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function bootstrap() {
@@ -633,14 +667,14 @@ async function bootstrap() {
   console.log("[BOOT] Connecting to MongoDB…");
   mongoClient = new MongoClient(MONGODB_URI, {
     serverApi: {
-      version: ServerApiVersion.v1,
-      strict: true,
+      version:          ServerApiVersion.v1,
+      strict:           true,
       deprecationErrors: true,
     },
-    maxPoolSize: 5,
-    minPoolSize: 1,
-    connectTimeoutMS: 10000,
-    socketTimeoutMS: 45000,
+    maxPoolSize:       5,
+    minPoolSize:       1,
+    connectTimeoutMS:  10000,
+    socketTimeoutMS:   45000,
   });
 
   await mongoClient.connect();
@@ -648,15 +682,8 @@ async function bootstrap() {
   animeCollection = db.collection(COLLECTION_NAME);
   console.log(`[BOOT] MongoDB connected → "${DB_NAME}"."${COLLECTION_NAME}"`);
 
-  // ── Indexes (aligned with indexer.js schema) ───────────────────────────────
-  await animeCollection.createIndex(
-    { total_episodes_indexed: -1, last_updated: -1 },
-    { name: "compound_catalog_sort", background: true }
-  );
-  await animeCollection.createIndex(
-    { anime_id: 1 },
-    { name: "unique_anime_id_slug", unique: true, background: true }
-  );
+  // ── Indexes ────────────────────────────────────────────────────────────────
+  await ensureIndexes();
   console.log("[BOOT] Indexes ensured.");
 
   // ── HTTP server — bind BEFORE Telegram so Render detects the port ──────────
