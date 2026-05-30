@@ -763,7 +763,7 @@ async function connectTelegramClient() {
         new StringSession(""),
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
-        { connectionRetries: 5, retryDelay: 2000, autoReconnect: true, baseLogger: gramLogger }
+        { connectionRetries: 5, retryDelay: 2000, autoReconnect: true, baseLogger: gramLogger, useWSS: true }
       );
 
       await withTimeout(
