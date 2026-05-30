@@ -74,6 +74,61 @@ let tgClient        = null;
 let tgReady         = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 2b. TELEGRAM SESSION PERSISTENCE
+//
+// On cold starts (Render free tier spins down after 15 min idle), GramJS needs
+// to do a full MTProto DH-key handshake with an empty StringSession — this
+// costs 60-120 s and reliably hits the old 60 s timeout.
+//
+// Fix: persist the session string to MongoDB after the first successful auth.
+// Every subsequent cold start loads the saved session → reconnects in <10 s.
+//
+// Override: set TELEGRAM_SESSION env var in Render to a pre-generated session
+// string (useful before the DB has ever stored one).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TG_SESSION_DOC_ID = "tg_bot_session";
+
+async function loadTgSession() {
+  // Env var takes priority (manual override for first deploy)
+  if (process.env.TELEGRAM_SESSION?.trim()) {
+    console.log("[TELEGRAM] Using TELEGRAM_SESSION env var.");
+    return process.env.TELEGRAM_SESSION.trim();
+  }
+  try {
+    const doc = await db.collection("bot_config").findOne({ _id: TG_SESSION_DOC_ID });
+    if (doc?.session_string) {
+      console.log("[TELEGRAM] Loaded saved MTProto session from DB.");
+      return doc.session_string;
+    }
+  } catch (e) {
+    console.warn("[TELEGRAM] Could not load saved session from DB:", e.message);
+  }
+  return ""; // fresh session — first run
+}
+
+async function saveTgSession(sessionString) {
+  if (!sessionString) return;
+  try {
+    await db.collection("bot_config").updateOne(
+      { _id: TG_SESSION_DOC_ID },
+      { $set: { session_string: sessionString, saved_at: new Date() } },
+      { upsert: true }
+    );
+    console.log("[TELEGRAM] MTProto session persisted to DB (fast reconnect on next cold start).");
+  } catch (e) {
+    console.warn("[TELEGRAM] Failed to persist session to DB:", e.message);
+  }
+}
+
+async function clearTgSession() {
+  try {
+    await db.collection("bot_config").deleteOne({ _id: TG_SESSION_DOC_ID });
+    console.log("[TELEGRAM] Cleared invalid/stale session from DB.");
+  } catch (e) { /* ignore */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 3. EXPRESS + CORS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -373,20 +428,23 @@ app.get("/api/anime/:slug/watch", async (req, res) => {
       attempted.telegram = true;
 
       if (!tgReady) {
-        // FIX: Return a retryable 503 instead of silently falling through.
-        // This prevents the misleading "All streaming methods exhausted" error
-        // when GramJS is still initializing on cold start.
-        console.warn(`[WATCH] Telegram not ready — returning 503 retry for "${slug}" Ep${episodeNum}.`);
-        return res.status(503).json({
-          success:     false,
-          error:       "Telegram client is still initializing. Please retry in 10–15 seconds.",
-          retry_after: 15,
-          tried:       { ...attempted, telegram: "pending" },
-        });
+        // FIX: Instead of hard-blocking with 503, fall through to iframe.
+        // On Render free-tier cold starts the Telegram client is still
+        // initialising; returning 503 every time gives users nothing.
+        // With session persistence (above) tgReady becomes true within ~10 s,
+        // so on the NEXT request Telegram will be used correctly.
+        console.warn(
+          `[WATCH] Telegram not ready — falling through to iframe for "${slug}" Ep${episodeNum}.`
+        );
+        // Do NOT return here — continue to Priority 3 (iframe).
+      } else {
+        console.log(
+          `[WATCH] Routing to Telegram stream: ch=${telegramSource.channel_id} msg=${telegramSource.message_id}`
+        );
+        return res.redirect(
+          `/stream/telegram/${telegramSource.channel_id}/${telegramSource.message_id}`
+        );
       }
-
-      console.log(`[WATCH] Routing to Telegram stream: ch=${telegramSource.channel_id} msg=${telegramSource.message_id}`);
-      return res.redirect(`/stream/telegram/${telegramSource.channel_id}/${telegramSource.message_id}`);
     }
 
     // ── Priority 3: Iframe API ─────────────────────────────────────────────
@@ -753,17 +811,24 @@ async function bootstrap() {
 }
 
 async function connectTelegramClient() {
-  const CONNECT_TIMEOUT = 60000;
+  // FIX: Increased from 60 s → 120 s.
+  // A fresh MTProto DH-key handshake on Render can take 90+ s on first boot.
+  const CONNECT_TIMEOUT = 120000;
   const RETRY_DELAY     = 15000;
+
+  // Load saved session ONCE before the retry loop.
+  // With a valid saved session the reconnect takes < 10 s instead of 90+ s.
+  let savedSession      = await loadTgSession();
+  let usedSavedSession  = !!savedSession;
 
   while (true) {
     try {
       const gramLogger = new Logger("none");
       const client     = new TelegramClient(
-        new StringSession(""),
+        new StringSession(savedSession),   // use saved session if available
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
-        { connectionRetries: 5, retryDelay: 2000, autoReconnect: true, baseLogger: gramLogger, useWSS: true }
+        { connectionRetries: 3, retryDelay: 3000, autoReconnect: true, baseLogger: gramLogger }
       );
 
       await withTimeout(
@@ -774,10 +839,31 @@ async function connectTelegramClient() {
 
       tgClient = client;
       tgReady  = true;
-      console.log("[TELEGRAM] ✅ MTProto session active.");
+
+      // Save the (possibly new) session string for the next cold start.
+      const newSession = client.session.save();
+      if (newSession && newSession !== savedSession) {
+        await saveTgSession(newSession);
+        savedSession = newSession;
+        console.log("[TELEGRAM] ✅ MTProto session active & persisted.");
+      } else {
+        console.log("[TELEGRAM] ✅ MTProto session active.");
+      }
       return;
 
     } catch (err) {
+      // If the saved session was invalid (revoked / corrupted), clear it and
+      // retry with a blank session so GramJS does a fresh auth.
+      const isAuthErr = /AUTH|FLOOD|session/i.test(err.message || "");
+      if (usedSavedSession && isAuthErr) {
+        console.warn(`[TELEGRAM] Saved session rejected (${err.message}). Clearing & retrying fresh…`);
+        await clearTgSession();
+        savedSession     = "";
+        usedSavedSession = false;
+        // No wait — retry immediately with fresh session
+        continue;
+      }
+
       console.error(`[TELEGRAM] Connection failed: ${err.message}. Retrying in ${RETRY_DELAY / 1000}s…`);
       tgReady = false;
       await new Promise((r) => setTimeout(r, RETRY_DELAY));
